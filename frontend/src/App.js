@@ -10,7 +10,7 @@ import { Switch } from "./components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "./components/ui/dialog";
 import { Input } from "./components/ui/input";
-import { CheckCircle2, Circle, CircleAlert, Play, Rocket, Wand2, Download, Link as LinkIcon, LockKeyhole } from "lucide-react";
+import { CheckCircle2, Circle, CircleAlert, Play, Rocket, Wand2, Link as LinkIcon, LockKeyhole, Download } from "lucide-react";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -30,6 +30,8 @@ const Home = () => {
   const [useN8n, setUseN8n] = useState(false);
   const [connOpen, setConnOpen] = useState(false);
   const [conn, setConn] = useState({ base_url: "", api_key: "", remember: false, id: null, persisted: false });
+  const [artifacts, setArtifacts] = useState([]);
+  const [wfGraph, setWfGraph] = useState(null);
   const [loading, setLoading] = useState({ design: false, run: false, saveConn: false });
   const [error, setError] = useState(null);
 
@@ -40,9 +42,26 @@ const Home = () => {
       .catch((e) => console.warn("/api root check failed", e?.message));
   }, []);
 
+  useEffect(() => {
+    const loadArtifacts = async () => {
+      if (!run?.id) return;
+      try {
+        const res = await axios.get(`${API}/runs/${run.id}/artifacts`);
+        setArtifacts(res.data.artifacts || []);
+      } catch {}
+      try {
+        const res2 = await axios.get(`${API}/runs/${run.id}/workflow`);
+        setWfGraph(res2.data);
+      } catch { setWfGraph(null); }
+    };
+    loadArtifacts();
+  }, [run?.id]);
+
   const doDesign = async () => {
     setError(null);
     setRun(null);
+    setArtifacts([]);
+    setWfGraph(null);
     setLoading((s) => ({ ...s, design: true }));
     try {
       const res = await axios.post(`${API}/design`, { goal });
@@ -107,6 +126,57 @@ const Home = () => {
       </div>
     );
   }, [run]);
+
+  const ArtifactButtons = () => {
+    if (!artifacts?.length) return null;
+    const junit = artifacts.find((a) => a.kind === "junit");
+    const wf = artifacts.find((a) => a.kind === "workflow_json");
+    return (
+      <div className="flex flex-wrap gap-2">
+        {junit && (
+          <a href={`${API}/artifacts/${junit.id}`}>
+            <Button variant="outline"><Download size={14} /> Download JUnit</Button>
+          </a>
+        )}
+        {wf && (
+          <a href={`${API}/artifacts/${wf.id}`}>
+            <Button variant="outline"><Download size={14} /> Download Workflow JSON</Button>
+          </a>
+        )}
+      </div>
+    );
+  };
+
+  const WorkflowGraph = () => {
+    if (!wfGraph?.nodes) return null;
+    // naive layout: use provided positions, fallback to grid
+    const nodes = wfGraph.nodes;
+    const conns = wfGraph.connections || {};
+    const width = 700, height = 260;
+    const nodeMap = nodes.reduce((acc, n) => { acc[n.name] = n; return acc; }, {});
+    const edges = Object.entries(conns).flatMap(([from, data]) => (data?.main || []).flatMap((arr) => arr.map((e) => ({ from, to: e.node }))));
+    const pos = (n) => ({ x: (n.position?.[0] || 100)/1.5, y: (n.position?.[1] || 100)/1.5 });
+    return (
+      <svg width={width} height={height} className="rounded-md border bg-white">
+        {edges.map((e, i) => {
+          const a = nodeMap[e.from];
+          const b = nodeMap[e.to];
+          if (!a || !b) return null;
+          const pa = pos(a), pb = pos(b);
+          return <line key={i} x1={pa.x} y1={pa.y} x2={pb.x} y2={pb.y} stroke="#9CA3AF" strokeWidth={2} />;
+        })}
+        {nodes.map((n, i) => {
+          const p = pos(n);
+          return (
+            <g key={i}>
+              <rect x={p.x-70} y={p.y-18} width={140} height={36} rx={8} fill="#111827" />
+              <text x={p.x} y={p.y+4} textAnchor="middle" fill="#F9FAFB" fontSize="12" fontFamily="monospace">{n.name}</text>
+            </g>
+          );
+        })}
+      </svg>
+    );
+  };
 
   return (
     <div className="min-h-screen bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-neutral-50 to-neutral-100">
@@ -214,6 +284,11 @@ const Home = () => {
                     <div className="text-xs text-muted-foreground">Run ID</div>
                     <div className="font-mono text-sm">{run.id}</div>
                   </div>
+                  {run?.meta?.n8nError && (
+                    <div className="rounded-md border p-3 bg-white text-red-700 text-sm">
+                      n8n error: {run.meta.n8nError}
+                    </div>
+                  )}
                   {run?.meta?.workflowId && (
                     <div className="rounded-md border p-3 bg-white">
                       <div className="text-xs text-muted-foreground mb-2">n8n Workflow</div>
@@ -232,6 +307,16 @@ const Home = () => {
                     <div className="rounded-md border p-3 bg-white">
                       <div className="text-xs text-muted-foreground mb-2">Execution log (first 20 lines)</div>
                       <pre className="text-xs font-mono whitespace-pre-wrap">{run.meta.executionLogFirst20.join("\n")}</pre>
+                    </div>
+                  )}
+                  <div className="rounded-md border p-3 bg-white">
+                    <div className="text-xs text-muted-foreground mb-1">Downloads</div>
+                    <ArtifactButtons />
+                  </div>
+                  {wfGraph && (
+                    <div className="rounded-md border p-3 bg-white">
+                      <div className="text-xs text-muted-foreground mb-2">Created n8n Workflow (mini map)</div>
+                      <WorkflowGraph />
                     </div>
                   )}
                   <div className="rounded-md border p-3 bg-white">

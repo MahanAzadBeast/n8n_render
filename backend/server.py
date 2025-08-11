@@ -326,12 +326,20 @@ class N8nClient:
         raise last_exc
 
     def create_workflow(self, name: str, nodes: List[Dict[str, Any]], connections: Dict[str, Any], active: bool = True) -> Dict[str, Any]:
-        payload = {"name": name, "nodes": nodes, "connections": connections, "active": active}
+        payload = {"name": name, "nodes": nodes, "connections": connections, "active": active, "settings": {}, "tags": []}
+        # Try api/v1 first
         resp = self._req("POST", self._api("workflows"), payload)
-        if resp.status_code == 404:
+        if resp.status_code not in (200, 201):
+            # Fallback to /rest even on 4xx
             resp = self._req("POST", self._rest("workflows"), payload)
         if resp.status_code not in (200, 201):
-            raise HTTPException(status_code=502, detail=f"n8n create workflow failed: {resp.status_code}")
+            detail = f"n8n create workflow failed: {resp.status_code}"
+            try:
+                body = (resp.text or "")
+                detail += f" body={mask_secrets(body)[:200]}"
+            except Exception:
+                pass
+            raise HTTPException(status_code=502, detail=detail)
         data = resp.json() if resp.content else {}
         if isinstance(data, dict) and "id" in data:
             return data
@@ -502,11 +510,9 @@ async def root():
 async def upsert_n8n_connection(payload: N8nConnectionCreate):
     base_url = (payload.base_url or "").strip().rstrip('/')
     api_key = payload.api_key.strip()
-    # create id
     conn_id = str(uuid.uuid4())
     persisted = False
     if payload.remember:
-        # requires FERNET_KEY
         doc = {
             "id": conn_id,
             "base_url": base_url,
@@ -530,6 +536,33 @@ async def get_n8n_connection(conn_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Connection not found")
     return N8nConnectionResponse(id=conn_id, base_url_masked=doc.get("base_url"), persisted=True)
+
+
+@api_router.get("/runs/{run_id}/artifacts")
+async def list_run_artifacts(run_id: str):
+    items = await db.artifacts.find({"run_id": run_id}).to_list(100)
+    base = "/api/artifacts/"
+    for it in items:
+        it["download_url"] = f"{base}{it['id']}"
+        it.pop("_id", None)
+    return {"artifacts": items}
+
+
+@api_router.get("/runs/{run_id}/workflow")
+async def get_run_workflow_graph(run_id: str):
+    a = await db.artifacts.find_one({"run_id": run_id, "kind": "workflow_json"})
+    if not a:
+        raise HTTPException(status_code=404, detail="Workflow artifact not found")
+    path = a.get("path")
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Workflow file missing")
+    import json
+    with open(path, "r", encoding="utf-8") as f:
+        wf = json.load(f)
+    # normalize
+    nodes = wf.get("nodes") or wf.get("data", {}).get("nodes") or []
+    connections = wf.get("connections") or wf.get("data", {}).get("connections") or {}
+    return {"nodes": nodes, "connections": connections}
 
 
 @api_router.post("/design", response_model=DesignResponse)
@@ -679,6 +712,10 @@ async def test_run(payload: TestRunInput):
         logging.exception("Execution error: %s", mask_secrets(str(e)))
         run.status = "FAIL"
         run.finished_at = datetime.utcnow()
+        # provide error to UI
+        if run.meta is None:
+            run.meta = {}
+        run.meta.update({"n8nError": mask_secrets(str(e))[:180]})
         try:
             if temp_workflow_id:
                 client.delete_workflow(temp_workflow_id)
