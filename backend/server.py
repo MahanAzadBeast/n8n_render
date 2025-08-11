@@ -351,8 +351,8 @@ class N8nClient:
         seg = "webhook-test" if is_test else "webhook"
         return f"{self.base_url}/{seg}/{path_only.lstrip('/')}"
 
-    def execute_webhook_test(self, path_only: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any], str]:
-        url = self.build_webhook_url(path_only, is_test=True)
+    def execute_webhook(self, path_only: str, body: Dict[str, Any], is_test: bool = False) -> Tuple[int, Dict[str, Any], str]:
+        url = self.build_webhook_url(path_only, is_test=is_test)
         backoff = 0.5
         for attempt in range(self.retries + 1):
             try:
@@ -367,8 +367,8 @@ class N8nClient:
                     time.sleep(backoff)
                     backoff *= 2
                 else:
-                    raise HTTPException(status_code=504, detail="webhook-test execution timeout")
-        raise HTTPException(status_code=504, detail="webhook-test execution timeout")
+                    raise HTTPException(status_code=504, detail="webhook execution timeout")
+        raise HTTPException(status_code=504, detail="webhook execution timeout")
 
     def fetch_recent_execution_log(self, workflow_id: str) -> List[str]:
         urls = [self._api(f"executions?workflowId={workflow_id}&limit=1&includeData=true"), self._rest(f"executions?workflowId={workflow_id}&limit=1&includeData=true")]
