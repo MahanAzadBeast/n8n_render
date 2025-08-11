@@ -6,9 +6,10 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import uuid
 from datetime import datetime
+import requests
 
 
 ROOT_DIR = Path(__file__).parent
@@ -32,6 +33,9 @@ class WorkflowNode(BaseModel):
     id: str
     type: str
     name: str
+    typeVersion: Optional[int] = 1
+    position: Optional[List[int]] = None
+    parameters: Optional[Dict[str, Any]] = None
 
 class WorkflowEdge(BaseModel):
     source: str
@@ -100,7 +104,6 @@ class Artifact(BaseModel):
 def mask_secrets(text: str) -> str:
     if not text:
         return text
-    # mask token=, key=, secret=, password=
     import re
     return re.sub(r"(?i)(token|key|secret|password)=([^\s&]+)", r"\1=***", text)
 
@@ -118,13 +121,12 @@ def jsonpath_get(data: Any, path: str) -> Any:
     cur = data
     for part in parts[1:]:
         if isinstance(cur, list):
-            # support [index]
             if part.endswith("]") and "[" in part:
                 name, idx = part.split("[")
                 idx = idx.replace("]", "")
                 if name:
                     try:
-                        cur = cur[int(name)]  # unlikely, keep simple
+                        cur = cur[int(name)]
                     except Exception:
                         return None
                 try:
@@ -137,7 +139,6 @@ def jsonpath_get(data: Any, path: str) -> Any:
             except Exception:
                 return None
         elif isinstance(cur, dict):
-            # handle field[0]
             key = part
             arr_index = None
             if part.endswith("]") and "[" in part:
@@ -161,13 +162,12 @@ def jsonpath_get(data: Any, path: str) -> Any:
 
 # Assertion engine implementing a simple DSL
 
-def eval_assertion(operator: str, args: Dict[str, Any], trace: Dict[str, Any]) -> (bool, str):
+def eval_assertion(operator: str, args: Dict[str, Any], trace: Dict[str, Any]) -> Tuple[bool, str]:
     op = operator
     try:
         if op == "pathTaken":
             expected = args.get("nodes", [])
             actual_types = [n.get("type") for n in trace.get("nodes", [])]
-            # check expected appears in order
             idx = 0
             for e in expected:
                 try:
@@ -177,7 +177,6 @@ def eval_assertion(operator: str, args: Dict[str, Any], trace: Dict[str, Any]) -
                 idx = pos + 1
             return True, "Path contains expected sequence"
         if op == "httpOutgoing":
-            # args: method?, urlContains?
             method = (args.get("method") or "").upper()
             url_contains = args.get("urlContains") or ""
             found = False
@@ -231,17 +230,16 @@ def eval_assertion(operator: str, args: Dict[str, Any], trace: Dict[str, Any]) -
                     return False, f"Non-numeric compare: {actual}, {expected}"
                 if op == "gt":
                     ok = a > b
-                    return ok, f"{a} &gt; {b}" if ok else f"{a} !&gt; {b}"
+                    return ok, f"{a} > {b}" if ok else f"{a} !> {b}"
                 else:
                     ok = a < b
-                    return ok, f"{a} &lt; {b}" if ok else f"{a} !&lt; {b}"
+                    return ok, f"{a} < {b}" if ok else f"{a} !< {b}"
         return False, f"Unknown operator: {op}"
     except Exception as e:
         return False, f"Exception evaluating {op}: {str(e)}"
 
 
 def generate_junit_xml(run: Run) -> str:
-    # Very small JUnit XML generator
     import xml.etree.ElementTree as ET
     ts = ET.Element("testsuite", name="assertions", tests=str(len(run.results)))
     for r in run.results:
@@ -251,6 +249,101 @@ def generate_junit_xml(run: Run) -> str:
             failure.text = r.message
     xml_str = ET.tostring(ts, encoding="unicode")
     return xml_str
+
+
+# ---------------
+# n8n Client
+# ---------------
+class N8nClient:
+    def __init__(self) -> None:
+        self.base_url = (os.environ.get("N8N_BASE_URL") or "").rstrip("/")
+        self.api_key = os.environ.get("N8N_API_KEY")
+        self.session = requests.Session()
+        self.session.headers.update({"X-N8N-API-KEY": self.api_key or ""})
+        self.timeout = 20
+
+    def _api(self, path: str) -> str:
+        return f"{self.base_url}/api/v1/{path.lstrip('/')}"
+
+    def _rest(self, path: str) -> str:
+        return f"{self.base_url}/rest/{path.lstrip('/')}"
+
+    def _post_json(self, url: str, payload: Dict[str, Any]) -> requests.Response:
+        return self.session.post(url, json=payload, timeout=self.timeout)
+
+    def _delete(self, url: str) -> requests.Response:
+        return self.session.delete(url, timeout=self.timeout)
+
+    def create_workflow(self, name: str, nodes: List[Dict[str, Any]], connections: Dict[str, Any], active: bool = False) -> Dict[str, Any]:
+        payload = {"name": name, "nodes": nodes, "connections": connections, "active": active}
+        # Try /api/v1 first, then fallback to /rest
+        resp = self._post_json(self._api("workflows"), payload)
+        if resp.status_code == 404:
+            resp = self._post_json(self._rest("workflows"), payload)
+        if resp.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"n8n create workflow failed: {resp.status_code}")
+        data = resp.json()
+        # Normalize a few possible shapes
+        if isinstance(data, dict) and "id" in data:
+            return data
+        if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
+            return data["data"]
+        return data
+
+    def delete_workflow(self, workflow_id: str) -> None:
+        url = self._api(f"workflows/{workflow_id}")
+        resp = self._delete(url)
+        if resp.status_code == 404:
+            url = self._rest(f"workflows/{workflow_id}")
+            resp = self._delete(url)
+        # Accept 200/204; ignore other errors silently to avoid leaking details
+
+    def build_webhook_url(self, test_path: str, is_test: bool = True) -> str:
+        seg = "webhook-test" if is_test else "webhook"
+        return f"{self.base_url}/{seg}/{test_path.lstrip('/')}"
+
+
+def build_uppercase_workflow(path_only: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    # Node names must match connections keys
+    nodes = [
+        {
+            "id": "Webhook",
+            "name": "Webhook",
+            "type": "n8n-nodes-base.webhook",
+            "typeVersion": 1,
+            "position": [100, 200],
+            "parameters": {
+                "path": path_only,
+                "httpMethod": "POST",
+            },
+        },
+        {
+            "id": "Code",
+            "name": "Code",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 1,
+            "position": [340, 200],
+            "parameters": {
+                "jsCode": "return [{ json: { upper: String($json.msg || '').toUpperCase() } }];",
+            },
+        },
+        {
+            "id": "Respond to Webhook",
+            "name": "Respond to Webhook",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [600, 200],
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={{$json}}",
+            },
+        },
+    ]
+    connections = {
+        "Webhook": {"main": [[{"node": "Code", "type": "main", "index": 0}]]},
+        "Code": {"main": [[{"node": "Respond to Webhook", "type": "main", "index": 0}]]},
+    }
+    return nodes, connections
 
 
 # ---------------
@@ -266,6 +359,7 @@ class DesignResponse(BaseModel):
 
 class TestRunInput(BaseModel):
     workflow_contract_id: Optional[str] = None
+    use_n8n: Optional[bool] = False
 
 class TestRunResponse(BaseModel):
     run: Run
@@ -282,7 +376,6 @@ async def root():
 @api_router.post("/design", response_model=DesignResponse)
 async def design(goal_input: GoalInput):
     goal = goal_input.goal.strip()
-    # Minimal rule-based planner just for the uppercase goal
     name = "Uppercase Echo"
     description = "On POST {msg}, reply with uppercase msg"
     nodes = [
@@ -325,7 +418,6 @@ async def design(goal_input: GoalInput):
     ]
     assertion_pack = AssertionPack(workflow_contract_id=contract.id, assertions=assertions)
 
-    # persist in DB
     await db.workflow_contracts.insert_one(contract.model_dump())
     await db.fixture_packs.insert_one(fixture_pack.model_dump())
     await db.assertion_packs.insert_one(assertion_pack.model_dump())
@@ -350,30 +442,66 @@ async def test_run(payload: TestRunInput):
 
     # Simulate state machine
     run.status = "PROVISIONING"
-    # no-op
-    run.status = "EXECUTING"
 
-    # Mock execution: take the only fixture and simulate uppercase response
+    use_n8n = bool(payload.use_n8n) and bool(os.environ.get("N8N_BASE_URL")) and bool(os.environ.get("N8N_API_KEY"))
+
     try:
-        fixture = fp["fixtures"][0]
-        body = fixture.get("body", {})
-        msg = str(body.get("msg", ""))
-        upper = msg.upper()
-        trace = {
-            "nodes": [
-                {"id": "webhook", "type": "Webhook", "status": "completed"},
-                {"id": "function", "type": "Function", "status": "completed"},
-                {"id": "respond", "type": "Respond", "status": "completed"},
-            ],
-            "httpOutgoing": [],
-            "response": {"status": 200, "body": {"upper": upper}},
-        }
+        if use_n8n:
+            # Build and create a temporary n8n workflow
+            client = N8nClient()
+            unique_path = f"avc-{run.id[:8]}"
+            nodes, connections = build_uppercase_workflow(unique_path)
+            wf = client.create_workflow(name=f"AVC Test {run.id[:8]}", nodes=nodes, connections=connections, active=False)
+            wf_id = str(wf.get("id") or wf.get("_id") or wf.get("data", {}).get("id"))
+            run.status = "EXECUTING"
+            # Execute test webhook
+            webhook_url = client.build_webhook_url(unique_path, is_test=True)
+            fixture = fp["fixtures"][0]
+            body = fixture.get("body", {})
+            resp = requests.post(webhook_url, json=body, timeout=20)
+            # Build trace from real response
+            try:
+                resp_json = resp.json()
+            except Exception:
+                resp_json = {}
+            trace = {
+                "nodes": [
+                    {"id": "webhook", "type": "Webhook", "status": "completed"},
+                    {"id": "function", "type": "Function", "status": "completed"},
+                    {"id": "respond", "type": "Respond", "status": "completed"},
+                ],
+                "httpOutgoing": [],
+                "response": {"status": resp.status_code, "body": resp_json},
+            }
+        else:
+            run.status = "EXECUTING"
+            # Mock execution: take the only fixture and simulate uppercase response
+            fixture = fp["fixtures"][0]
+            body = fixture.get("body", {})
+            msg = str(body.get("msg", ""))
+            upper = msg.upper()
+            trace = {
+                "nodes": [
+                    {"id": "webhook", "type": "Webhook", "status": "completed"},
+                    {"id": "function", "type": "Function", "status": "completed"},
+                    {"id": "respond", "type": "Respond", "status": "completed"},
+                ],
+                "httpOutgoing": [],
+                "response": {"status": 200, "body": {"upper": upper}},
+            }
     except Exception as e:
         logging.exception("Execution error: %s", mask_secrets(str(e)))
         run.status = "FAIL"
         run.finished_at = datetime.utcnow()
         await db.runs.update_one({"id": run.id}, {"$set": run.model_dump()})
         return TestRunResponse(run=run)
+    finally:
+        # Cleanup temp workflow if created
+        try:
+            if use_n8n:
+                client.delete_workflow(wf_id)
+        except Exception:
+            pass
 
     run.status = "ASSERTING"
     results: List[AssertionResult] = []
@@ -397,7 +525,6 @@ async def test_run(payload: TestRunInput):
 
     await db.runs.update_one({"id": run.id}, {"$set": run.model_dump()})
 
-    # Also persist artifact record (mock URL)
     artifact = Artifact(run_id=run.id, kind="junit", path=str(junit_path), url=None)
     await db.artifacts.insert_one(artifact.model_dump())
 
@@ -423,7 +550,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
