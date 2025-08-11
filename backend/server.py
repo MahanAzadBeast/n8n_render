@@ -642,7 +642,7 @@ async def test_run(payload: TestRunInput):
             webhook_prod_url = client.build_webhook_url(unique_path, is_test=False)
             fixture = fp["fixtures"][0]
             body = redact_dict(fixture.get("body", {}))
-            status_code, resp_json, _ = client.execute_webhook_test(unique_path, body)
+            status_code, resp_json, _ = client.execute_webhook(unique_path, body, is_test=True)
             exec_lines = client.fetch_recent_execution_log(temp_workflow_id)
             trace = {
                 "nodes": [
