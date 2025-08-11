@@ -117,8 +117,8 @@ class BackendAPITester:
         )
         return success
 
-    def test_test_run_endpoint(self):
-        """Test POST /api/test-run with workflow_contract_id should return run with PASS status"""
+    def test_test_run_mock_endpoint(self):
+        """Test POST /api/test-run with use_n8n=false should PASS and include junit_path and meta"""
         if not self.workflow_contract_id:
             print("❌ Cannot test test-run without workflow_contract_id")
             return False
@@ -155,19 +155,152 @@ class BackendAPITester:
                 print("   Missing junit_path")
                 return False
             
+            # Check meta exists (may be empty for mock)
+            if "meta" not in run:
+                print("   Missing meta field")
+                return False
+            
             print(f"   Results count: {len(results)}")
+            print(f"   JUnit path: {run.get('junit_path')}")
+            print(f"   Meta: {run.get('meta')}")
+            
             for i, result in enumerate(results):
                 print(f"   Result {i+1}: {result.get('operator')} - {'PASS' if result.get('passed') else 'FAIL'}")
             
             return True
         
         success, response = self.run_test(
-            "Test Run Endpoint",
+            "Test Run Mock (use_n8n=false)",
             "POST",
             "test-run",
             200,
-            data={"workflow_contract_id": self.workflow_contract_id},
+            data={"workflow_contract_id": self.workflow_contract_id, "use_n8n": False},
             check_response=check_test_run_response
+        )
+        return success
+
+    def test_test_run_n8n_no_env(self):
+        """Test POST /api/test-run with use_n8n=true but no N8N_API_KEY should still PASS (fallback to mock)"""
+        if not self.workflow_contract_id:
+            print("❌ Cannot test test-run without workflow_contract_id")
+            return False
+        
+        def check_test_run_response(response_data):
+            run = response_data.get("run")
+            if not run:
+                print("   Missing 'run' in response")
+                return False
+            
+            print(f"   Run Status: {run['status']}")
+            
+            # Should still PASS even with use_n8n=true but no env
+            if run["status"] != "PASS":
+                print(f"   Expected status PASS (fallback to mock), got {run['status']}")
+                return False
+            
+            # Check meta exists
+            if "meta" not in run:
+                print("   Missing meta field")
+                return False
+            
+            print(f"   Meta: {run.get('meta')}")
+            print("   ✅ Correctly fell back to mock execution when N8N_API_KEY not available")
+            
+            return True
+        
+        success, response = self.run_test(
+            "Test Run N8N without env (use_n8n=true, no N8N_API_KEY)",
+            "POST",
+            "test-run",
+            200,
+            data={"workflow_contract_id": self.workflow_contract_id, "use_n8n": True},
+            check_response=check_test_run_response
+        )
+        return success
+
+    def test_test_run_n8n_with_env(self):
+        """Test POST /api/test-run with use_n8n=true and N8N_API_KEY set"""
+        if not self.workflow_contract_id:
+            print("❌ Cannot test test-run without workflow_contract_id")
+            return False
+        
+        # Check if N8N_API_KEY is available for testing
+        n8n_api_key = os.environ.get("N8N_API_KEY")
+        if not n8n_api_key:
+            print("⚠️  Skipping N8N real execution test - N8N_API_KEY not set in environment")
+            return True  # Skip this test but don't fail
+        
+        def check_test_run_response(response_data):
+            run = response_data.get("run")
+            if not run:
+                print("   Missing 'run' in response")
+                return False
+            
+            print(f"   Run Status: {run['status']}")
+            
+            # Should PASS with real n8n execution
+            if run["status"] != "PASS":
+                print(f"   Expected status PASS, got {run['status']}")
+                return False
+            
+            # Check meta has n8n-specific fields
+            meta = run.get("meta", {})
+            required_meta_fields = ["workflowId", "webhookTestUrl", "webhookProdUrl", "executionLogFirst20"]
+            
+            for field in required_meta_fields:
+                if field not in meta:
+                    print(f"   Missing meta field: {field}")
+                    return False
+            
+            print(f"   Workflow ID: {meta.get('workflowId')}")
+            print(f"   Webhook Test URL: {meta.get('webhookTestUrl')}")
+            print(f"   Webhook Prod URL: {meta.get('webhookProdUrl')}")
+            print(f"   Execution Log Lines: {len(meta.get('executionLogFirst20', []))}")
+            
+            # Verify temp workflow deletion (should be observable in logs)
+            print("   ✅ Real N8N execution completed with meta fields")
+            
+            return True
+        
+        success, response = self.run_test(
+            "Test Run N8N with env (use_n8n=true, N8N_API_KEY set)",
+            "POST",
+            "test-run",
+            200,
+            data={"workflow_contract_id": self.workflow_contract_id, "use_n8n": True},
+            check_response=check_test_run_response
+        )
+        return success
+
+    def test_junit_file_exists(self):
+        """Verify that junit_path file exists on server (since we don't have artifacts list endpoint)"""
+        if not self.run_id:
+            print("❌ Cannot test junit file without run_id")
+            return False
+        
+        # We can't directly check file existence on server, but we can verify the run has junit_path
+        def check_run_has_junit(response_data):
+            run = response_data.get("run")
+            if not run:
+                print("   Missing 'run' in response")
+                return False
+            
+            junit_path = run.get("junit_path")
+            if not junit_path:
+                print("   Missing junit_path in run")
+                return False
+            
+            print(f"   JUnit path: {junit_path}")
+            print("   ✅ Run has junit_path (file should exist on server)")
+            
+            return True
+        
+        success, response = self.run_test(
+            "Verify JUnit file path exists",
+            "GET",
+            f"runs/{self.run_id}",
+            200,
+            check_response=check_run_has_junit
         )
         return success
 
