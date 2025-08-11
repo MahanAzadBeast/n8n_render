@@ -1,6 +1,7 @@
 import requests
 import sys
 import json
+import os
 from datetime import datetime
 
 class BackendAPITester:
@@ -11,6 +12,7 @@ class BackendAPITester:
         self.tests_passed = 0
         self.workflow_contract_id = None
         self.run_id = None
+        self.junit_artifact_id = None
 
     def run_test(self, name, method, endpoint, expected_status, data=None, check_response=None):
         """Run a single API test"""
