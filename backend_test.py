@@ -345,8 +345,11 @@ def main():
     tests = [
         ("Root Endpoint", tester.test_root_endpoint),
         ("Design Endpoint", tester.test_design_endpoint),
-        ("Test Run Endpoint", tester.test_test_run_endpoint),
+        ("Test Run Mock", tester.test_test_run_mock_endpoint),
+        ("Test Run N8N No Env", tester.test_test_run_n8n_no_env),
+        ("Test Run N8N With Env", tester.test_test_run_n8n_with_env),
         ("Get Run Endpoint", tester.test_get_run_endpoint),
+        ("JUnit File Exists", tester.test_junit_file_exists),
     ]
     
     for test_name, test_func in tests:
