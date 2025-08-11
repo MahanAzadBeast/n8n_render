@@ -8,23 +8,32 @@ import { Textarea } from "./components/ui/textarea";
 import { Badge } from "./components/ui/badge";
 import { Switch } from "./components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
-import { CheckCircle2, Circle, CircleAlert, Play, Rocket, Wand2, Download } from "lucide-react";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "./components/ui/dialog";
+import { Input } from "./components/ui/input";
+import { CheckCircle2, Circle, CircleAlert, Play, Rocket, Wand2, Download, Link as LinkIcon, LockKeyhole } from "lucide-react";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
 const pretty = (obj) => JSON.stringify(obj, null, 2);
 
+const goalExamples = [
+  { label: "Demo: Uppercase (ready)", value: "On POST {msg}, reply with uppercase msg" },
+  { label: "Email: Welcome sender (design only)", value: "On POST {email}, send welcome email" },
+  { label: "Slack: Notify on lead (design only)", value: "When a new lead arrives, send Slack notification" },
+];
+
 const Home = () => {
   const [goal, setGoal] = useState("On POST {msg}, reply with uppercase msg");
   const [design, setDesign] = useState(null);
   const [run, setRun] = useState(null);
   const [useN8n, setUseN8n] = useState(false);
-  const [loading, setLoading] = useState({ design: false, run: false });
+  const [connOpen, setConnOpen] = useState(false);
+  const [conn, setConn] = useState({ base_url: "", api_key: "", remember: false, id: null, persisted: false });
+  const [loading, setLoading] = useState({ design: false, run: false, saveConn: false });
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    // sanity check API
     axios
       .get(`${API}/`)
       .then((res) => console.log(res.data.message))
@@ -53,12 +62,31 @@ const Home = () => {
       const res = await axios.post(`${API}/test-run`, {
         workflow_contract_id: design.workflowContract.id,
         use_n8n: useN8n,
+        n8n_connection_id: conn.id || undefined,
       });
       setRun(res.data.run);
     } catch (e) {
       setError(e?.response?.data?.detail || e.message);
     } finally {
       setLoading((s) => ({ ...s, run: false }));
+    }
+  };
+
+  const saveConnection = async () => {
+    setLoading((s) => ({ ...s, saveConn: true }));
+    setError(null);
+    try {
+      const res = await axios.post(`${API}/n8n/connections`, {
+        base_url: conn.base_url,
+        api_key: conn.api_key,
+        remember: !!conn.remember,
+      });
+      setConn((c) => ({ ...c, id: res.data.id, persisted: res.data.persisted }));
+      setConnOpen(false);
+    } catch (e) {
+      setError(e?.response?.data?.detail || e.message);
+    } finally {
+      setLoading((s) => ({ ...s, saveConn: false }));
     }
   };
 
@@ -79,14 +107,6 @@ const Home = () => {
       </div>
     );
   }, [run]);
-
-  const artifactLink = (kind) => {
-    if (!run) return null;
-    // we didn't store artifact IDs in run; offer direct file links by requesting the latest run's artifacts is not available.
-    // As a minimal UX: expose JUnit path download via API/artifacts by looking it up requires ID. 
-    // We'll present meta.workflowId and instruct to use backend artifacts list later.
-    return null;
-  };
 
   return (
     <div className="min-h-screen bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-neutral-50 to-neutral-100">
@@ -112,9 +132,39 @@ const Home = () => {
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
-            <a href="https://emergent.sh" target="_blank" rel="noreferrer">
-              <Badge variant="secondary">Docs</Badge>
-            </a>
+            <Dialog open={connOpen} onOpenChange={setConnOpen}>
+              <DialogTrigger asChild>
+                <Button variant="outline"><LockKeyhole size={16} /> Set n8n API</Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Connect to your n8n</DialogTitle>
+                  <DialogDescription>
+                    Enter your n8n base URL and API key. We never log your key. You can optionally store it encrypted on this server.
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="space-y-3">
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">Base URL</div>
+                    <Input placeholder="https://your-instance.app.n8n.cloud" value={conn.base_url} onChange={(e) => setConn({ ...conn, base_url: e.target.value })} />
+                  </div>
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">API Key</div>
+                    <Input type="password" placeholder="X-N8N-API-KEY" value={conn.api_key} onChange={(e) => setConn({ ...conn, api_key: e.target.value })} />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Switch checked={conn.remember} onCheckedChange={(v) => setConn({ ...conn, remember: v })} />
+                    <span className="text-sm">Remember on this server (encrypted)</span>
+                  </div>
+                </div>
+                <DialogFooter>
+                  <Button onClick={saveConnection} disabled={loading.saveConn}>Save</Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+            {conn.id && (
+              <Badge variant="secondary">Connected {conn.persisted ? "(encrypted)" : "(session)"}</Badge>
+            )}
           </div>
         </header>
 
@@ -130,6 +180,11 @@ const Home = () => {
                 onChange={(e) => setGoal(e.target.value)}
                 className="min-h-[120px]"
               />
+              <div className="mt-2 flex flex-wrap gap-2">
+                {goalExamples.map((g) => (
+                  <Badge key={g.label} className="cursor-pointer" onClick={() => setGoal(g.value)}>{g.label}</Badge>
+                ))}
+              </div>
               <div className="mt-4 flex gap-2">
                 <Button onClick={doDesign} disabled={loading.design}>
                   <Rocket size={16} /> {loading.design ? "Designing..." : "Design"}
@@ -165,6 +220,12 @@ const Home = () => {
                       <div className="text-sm">Workflow ID: <span className="font-mono">{run.meta.workflowId}</span></div>
                       <div className="text-sm truncate">Test URL: <span className="font-mono">{run.meta.webhookTestUrl}</span></div>
                       <div className="text-sm truncate">Prod URL: <span className="font-mono">{run.meta.webhookProdUrl}</span></div>
+                      {run?.meta?.workflowEditorUrl && (
+                        <div className="text-sm flex items-center gap-2 mt-2">
+                          <LinkIcon size={14} />
+                          <a className="underline" href={run.meta.workflowEditorUrl} target="_blank" rel="noreferrer">Open in n8n (login required)</a>
+                        </div>
+                      )}
                     </div>
                   )}
                   {Array.isArray(run?.meta?.executionLogFirst20) && run.meta.executionLogFirst20.length > 0 && (

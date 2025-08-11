@@ -12,6 +12,7 @@ from datetime import datetime
 import requests
 import time
 import re
+from cryptography.fernet import Fernet, InvalidToken
 
 
 ROOT_DIR = Path(__file__).parent
@@ -100,6 +101,17 @@ class Artifact(BaseModel):
     url: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+# N8N Connections (optional persistence)
+class N8nConnectionCreate(BaseModel):
+    base_url: str
+    api_key: str
+    remember: Optional[bool] = False
+
+class N8nConnectionResponse(BaseModel):
+    id: str
+    base_url_masked: str
+    persisted: bool
+
 # ---------------
 # Utilities
 # ---------------
@@ -113,7 +125,6 @@ def mask_secrets(text: str) -> str:
 
 
 def redact_dict(d: Any) -> Any:
-    # recursively redact dict keys and URL queries containing sensitive terms
     if isinstance(d, dict):
         out = {}
         for k, v in d.items():
@@ -125,7 +136,6 @@ def redact_dict(d: Any) -> Any:
     if isinstance(d, list):
         return [redact_dict(x) for x in d]
     if isinstance(d, str):
-        # redact query parts like ?token=... or &api_key=...
         return re.sub(r"(?i)(token|key|secret|password)=([^&\s]+)", r"\1=***", d)
     return d
 
@@ -277,9 +287,9 @@ def generate_junit_xml(run: Run) -> str:
 # n8n Client with retries and redaction
 # ---------------
 class N8nClient:
-    def __init__(self) -> None:
-        self.base_url = (os.environ.get("N8N_BASE_URL") or "").rstrip("/")
-        self.api_key = os.environ.get("N8N_API_KEY")
+    def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.base_url = (base_url or os.environ.get("N8N_BASE_URL") or "").rstrip("/")
+        self.api_key = api_key or os.environ.get("N8N_API_KEY")
         self.session = requests.Session()
         if self.api_key:
             self.session.headers.update({"X-N8N-API-KEY": self.api_key})
@@ -313,7 +323,7 @@ class N8nClient:
                     backoff *= 2
                 else:
                     raise
-        raise last_exc  # should not reach
+        raise last_exc
 
     def create_workflow(self, name: str, nodes: List[Dict[str, Any]], connections: Dict[str, Any], active: bool = True) -> Dict[str, Any]:
         payload = {"name": name, "nodes": nodes, "connections": connections, "active": active}
@@ -335,7 +345,6 @@ class N8nClient:
             if resp.status_code == 404:
                 self._req("DELETE", self._rest(f"workflows/{workflow_id}"))
         except Exception:
-            # Swallow to ensure cleanup best-effort
             pass
 
     def build_webhook_url(self, path_only: str, is_test: bool = True) -> str:
@@ -345,7 +354,6 @@ class N8nClient:
     def execute_webhook_test(self, path_only: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any], str]:
         url = self.build_webhook_url(path_only, is_test=True)
         backoff = 0.5
-        last_exc = None
         for attempt in range(self.retries + 1):
             try:
                 resp = self._req("POST", url, json_payload=body, auth_header=False)
@@ -354,8 +362,7 @@ class N8nClient:
                 except Exception:
                     data = {}
                 return resp.status_code, data, url
-            except Exception as e:
-                last_exc = e
+            except Exception:
                 if attempt < self.retries:
                     time.sleep(backoff)
                     backoff *= 2
@@ -370,14 +377,12 @@ class N8nClient:
                 resp = self._req("GET", u)
                 if resp.status_code == 200 and resp.content:
                     j = resp.json()
-                    # Normalize potential shapes
                     execs = None
                     if isinstance(j, dict):
                         execs = j.get("data") or j.get("executions") or j.get("items") or j.get("results")
                     if isinstance(execs, list) and execs:
                         e0 = execs[0]
                         lines = []
-                        # Try common execution structure
                         run_data = None
                         if isinstance(e0, dict):
                             run_data = (e0.get("data") or e0.get("resultData") or {}).get("resultData") or (e0.get("data") or {}).get("resultData")
@@ -386,13 +391,10 @@ class N8nClient:
                                 for node_name, arr in rd.items():
                                     if isinstance(arr, list):
                                         for idx, item in enumerate(arr):
-                                            out = item.get("data", {}).get("main") if isinstance(item, dict) else None
                                             lines.append(f"Node {node_name} step {idx}")
                                 if lines:
                                     return lines[:20]
-                        # Fallback to dump keys
-                        lines = [f"keys: {list(e0.keys())}"]
-                        return lines[:20]
+                        return [f"keys: {list(e0.keys())}"][:20]
             except Exception:
                 continue
         return []
@@ -454,9 +456,38 @@ class DesignResponse(BaseModel):
 class TestRunInput(BaseModel):
     workflow_contract_id: Optional[str] = None
     use_n8n: Optional[bool] = False
+    n8n_connection_id: Optional[str] = None
 
 class TestRunResponse(BaseModel):
     run: Run
+
+
+# ---------------
+# In-memory ephemeral connection cache and encryption helpers
+# ---------------
+CONN_CACHE: Dict[str, Dict[str, str]] = {}
+FERNET_KEY = os.environ.get("N8N_CRYPT_KEY")
+FERNET: Optional[Fernet] = None
+if FERNET_KEY:
+    try:
+        FERNET = Fernet(FERNET_KEY.encode())
+    except Exception:
+        FERNET = None
+
+
+def encrypt(text: str) -> str:
+    if FERNET is None:
+        return text
+    return FERNET.encrypt(text.encode()).decode()
+
+
+def decrypt(text: str) -> str:
+    if FERNET is None:
+        return text
+    try:
+        return FERNET.decrypt(text.encode()).decode()
+    except InvalidToken:
+        return text
 
 
 # ---------------
@@ -465,6 +496,40 @@ class TestRunResponse(BaseModel):
 @api_router.get("/")
 async def root():
     return {"message": "Hello World"}
+
+
+@api_router.post("/n8n/connections", response_model=N8nConnectionResponse)
+async def upsert_n8n_connection(payload: N8nConnectionCreate):
+    base_url = (payload.base_url or "").strip().rstrip('/')
+    api_key = payload.api_key.strip()
+    # create id
+    conn_id = str(uuid.uuid4())
+    persisted = False
+    if payload.remember:
+        # requires FERNET_KEY
+        doc = {
+            "id": conn_id,
+            "base_url": base_url,
+            "api_key_encrypted": encrypt(api_key),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        await db.n8n_connections.insert_one(doc)
+        persisted = True
+    else:
+        CONN_CACHE[conn_id] = {"base_url": base_url, "api_key": api_key}
+    masked = base_url
+    return N8nConnectionResponse(id=conn_id, base_url_masked=masked, persisted=persisted)
+
+
+@api_router.get("/n8n/connections/{conn_id}", response_model=N8nConnectionResponse)
+async def get_n8n_connection(conn_id: str):
+    if conn_id in CONN_CACHE:
+        base_url = CONN_CACHE[conn_id]["base_url"]
+        return N8nConnectionResponse(id=conn_id, base_url_masked=base_url, persisted=False)
+    doc = await db.n8n_connections.find_one({"id": conn_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    return N8nConnectionResponse(id=conn_id, base_url_masked=doc.get("base_url"), persisted=True)
 
 
 @api_router.post("/design", response_model=DesignResponse)
@@ -536,7 +601,21 @@ async def test_run(payload: TestRunInput):
 
     run.status = "PROVISIONING"
 
-    use_n8n = bool(payload.use_n8n) and bool(os.environ.get("N8N_BASE_URL")) and bool(os.environ.get("N8N_API_KEY"))
+    # Resolve n8n connection
+    resolved_base = None
+    resolved_key = None
+    if payload.use_n8n and payload.n8n_connection_id:
+        if payload.n8n_connection_id in CONN_CACHE:
+            resolved_base = CONN_CACHE[payload.n8n_connection_id]["base_url"]
+            resolved_key = CONN_CACHE[payload.n8n_connection_id]["api_key"]
+        else:
+            doc = await db.n8n_connections.find_one({"id": payload.n8n_connection_id})
+            if doc:
+                resolved_base = doc.get("base_url")
+                resolved_key = decrypt(doc.get("api_key_encrypted", "")) if doc.get("api_key_encrypted") else None
+
+    use_n8n = bool(payload.use_n8n) and ((resolved_base and resolved_key) or (os.environ.get("N8N_BASE_URL") and os.environ.get("N8N_API_KEY")))
+
     temp_workflow_id = None
     webhook_test_url = None
     webhook_prod_url = None
@@ -544,7 +623,7 @@ async def test_run(payload: TestRunInput):
 
     try:
         if use_n8n:
-            client = N8nClient()
+            client = N8nClient(base_url=resolved_base, api_key=resolved_key)
             unique_path = f"avc-{run.id[:8]}"
             nodes, connections = build_uppercase_workflow(unique_path)
             wf = client.create_workflow(name=f"AVC Test {run.id[:8]}", nodes=nodes, connections=connections, active=True)
@@ -562,7 +641,7 @@ async def test_run(payload: TestRunInput):
             webhook_test_url = client.build_webhook_url(unique_path, is_test=True)
             webhook_prod_url = client.build_webhook_url(unique_path, is_test=False)
             fixture = fp["fixtures"][0]
-            body = redact_dict(fixture.get("body", {}))  # ensure no secrets in request body we log
+            body = redact_dict(fixture.get("body", {}))
             status_code, resp_json, _ = client.execute_webhook_test(unique_path, body)
             exec_lines = client.fetch_recent_execution_log(temp_workflow_id)
             trace = {
@@ -576,13 +655,13 @@ async def test_run(payload: TestRunInput):
             }
             run.meta.update({
                 "workflowId": temp_workflow_id,
+                "workflowEditorUrl": f"{client.base_url}/workflow/{temp_workflow_id}",
                 "webhookTestUrl": redact_dict(webhook_test_url),
                 "webhookProdUrl": redact_dict(webhook_prod_url),
                 "executionLogFirst20": exec_lines[:20] if exec_lines else [],
             })
         else:
             run.status = "EXECUTING"
-            # Mock execution
             fixture = fp["fixtures"][0]
             body = fixture.get("body", {})
             msg = str(body.get("msg", ""))
@@ -600,26 +679,23 @@ async def test_run(payload: TestRunInput):
         logging.exception("Execution error: %s", mask_secrets(str(e)))
         run.status = "FAIL"
         run.finished_at = datetime.utcnow()
-        # Clean up temp workflow if created
         try:
             if temp_workflow_id:
-                N8nClient().delete_workflow(temp_workflow_id)
+                client.delete_workflow(temp_workflow_id)
         except Exception:
             pass
         await db.runs.update_one({"id": run.id}, {"$set": run.model_dump()})
         return TestRunResponse(run=run)
     finally:
-        # Always attempt cleanup
         try:
             if temp_workflow_id:
-                N8nClient().delete_workflow(temp_workflow_id)
+                client.delete_workflow(temp_workflow_id)
         except Exception:
             pass
 
     run.status = "ASSERTING"
     results: List[AssertionResult] = []
-    ap_doc = ap
-    for a in ap_doc["assertions"]:
+    for a in ap["assertions"]:
         ok, message = eval_assertion(a.get("operator"), a.get("args", {}), trace)
         results.append(AssertionResult(assertion_id=a.get("id"), operator=a.get("operator"), passed=ok, message=message))
 
@@ -660,7 +736,6 @@ async def download_artifact(artifact_id: str):
     path = a.get("path")
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File missing")
-    # naive content type; callers can rely on filename extension
     with open(path, 'rb') as f:
         data = f.read()
     filename = os.path.basename(path)
