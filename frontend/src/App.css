@@ -1,34 +1,16 @@
-.App-logo {
-    height: 40vmin;
-    pointer-events: none;
+/* Typography & base */
+@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@300;400;600;700&amp;display=swap');
+
+:root { 
+  --brand: 0 0% 9%;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-    .App-logo {
-        animation: App-logo-spin infinite 20s linear;
-    }
-}
+html, body, #root, .App { height: 100%; }
 
-.App-header {
-    background-color: #0f0f10;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    font-size: calc(10px + 2vmin);
-    color: white;
-}
+body { font-family: 'Figtree', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
 
-.App-link {
-    color: #61dafb;
-}
+/* Micro-interactions */
+button, a { transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease; }
 
-@keyframes App-logo-spin {
-    from {
-        transform: rotate(0deg);
-    }
-    to {
-        transform: rotate(360deg);
-    }
-}
+/* Cards */
+pre { white-space: pre-wrap; word-break: break-word; }
