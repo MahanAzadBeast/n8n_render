@@ -230,7 +230,7 @@ def eval_assertion(operator: str, args: Dict[str, Any], trace: Dict[str, Any]) -
                 except Exception:
                     return False, f"Non-numeric compare: {actual}, {expected}"
                 if op == "gt":
-                    ok = a &gt; b
+                    ok = a > b
                     return ok, f"{a} &gt; {b}" if ok else f"{a} !&gt; {b}"
                 else:
                     ok = a &lt; b
