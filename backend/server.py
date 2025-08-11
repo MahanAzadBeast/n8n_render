@@ -451,7 +451,7 @@ async def test_run(payload: TestRunInput):
             client = N8nClient()
             unique_path = f"avc-{run.id[:8]}"
             nodes, connections = build_uppercase_workflow(unique_path)
-            wf = client.create_workflow(name=f"AVC Test {run.id[:8]}", nodes=nodes, connections=connections, active=False)
+            wf = client.create_workflow(name=f"AVC Test {run.id[:8]}", nodes=nodes, connections=connections, active=True)
             wf_id = str(wf.get("id") or wf.get("_id") or wf.get("data", {}).get("id"))
             run.status = "EXECUTING"
             # Execute test webhook
