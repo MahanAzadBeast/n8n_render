@@ -6,7 +6,9 @@ import { Button } from "./components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
 import { Textarea } from "./components/ui/textarea";
 import { Badge } from "./components/ui/badge";
-import { CheckCircle2, Circle, CircleAlert, Play, Rocket, Wand2 } from "lucide-react";
+import { Switch } from "./components/ui/switch";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
+import { CheckCircle2, Circle, CircleAlert, Play, Rocket, Wand2, Download } from "lucide-react";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -17,6 +19,7 @@ const Home = () => {
   const [goal, setGoal] = useState("On POST {msg}, reply with uppercase msg");
   const [design, setDesign] = useState(null);
   const [run, setRun] = useState(null);
+  const [useN8n, setUseN8n] = useState(false);
   const [loading, setLoading] = useState({ design: false, run: false });
   const [error, setError] = useState(null);
 
@@ -49,6 +52,7 @@ const Home = () => {
     try {
       const res = await axios.post(`${API}/test-run`, {
         workflow_contract_id: design.workflowContract.id,
+        use_n8n: useN8n,
       });
       setRun(res.data.run);
     } catch (e) {
@@ -76,17 +80,38 @@ const Home = () => {
     );
   }, [run]);
 
+  const artifactLink = (kind) => {
+    if (!run) return null;
+    // we didn't store artifact IDs in run; offer direct file links by requesting the latest run's artifacts is not available.
+    // As a minimal UX: expose JUnit path download via API/artifacts by looking it up requires ID. 
+    // We'll present meta.workflowId and instruct to use backend artifacts list later.
+    return null;
+  };
+
   return (
     <div className="min-h-screen bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-neutral-50 to-neutral-100">
       <div className="mx-auto max-w-6xl px-6 py-8">
         <header className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Agentic Vibecoder (Mock)</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">Agentic Vibecoder</h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Design → Test-run → Assertions without external calls. Powered by your /api.
+              Design → Test-run → Assertions. Toggle n8n to execute on your instance.
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex items-center gap-3">
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div className="flex items-center gap-2">
+                    <Switch checked={useN8n} onCheckedChange={setUseN8n} />
+                    <span className="text-sm select-none">Use n8n (Real)</span>
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent>
+                  Executes on your n8n instance with your API key. Uses webhook-test; cleans up after run.
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             <a href="https://emergent.sh" target="_blank" rel="noreferrer">
               <Badge variant="secondary">Docs</Badge>
             </a>
@@ -134,6 +159,20 @@ const Home = () => {
                     <div className="text-xs text-muted-foreground">Run ID</div>
                     <div className="font-mono text-sm">{run.id}</div>
                   </div>
+                  {run?.meta?.workflowId && (
+                    <div className="rounded-md border p-3 bg-white">
+                      <div className="text-xs text-muted-foreground mb-2">n8n Workflow</div>
+                      <div className="text-sm">Workflow ID: <span className="font-mono">{run.meta.workflowId}</span></div>
+                      <div className="text-sm truncate">Test URL: <span className="font-mono">{run.meta.webhookTestUrl}</span></div>
+                      <div className="text-sm truncate">Prod URL: <span className="font-mono">{run.meta.webhookProdUrl}</span></div>
+                    </div>
+                  )}
+                  {Array.isArray(run?.meta?.executionLogFirst20) && run.meta.executionLogFirst20.length > 0 && (
+                    <div className="rounded-md border p-3 bg-white">
+                      <div className="text-xs text-muted-foreground mb-2">Execution log (first 20 lines)</div>
+                      <pre className="text-xs font-mono whitespace-pre-wrap">{run.meta.executionLogFirst20.join("\n")}</pre>
+                    </div>
+                  )}
                   <div className="rounded-md border p-3 bg-white">
                     <div className="text-xs text-muted-foreground">Assertions</div>
                     <ul className="mt-2 space-y-2">
@@ -185,7 +224,7 @@ const Home = () => {
         </main>
 
         <footer className="mt-10 py-8 text-center text-xs text-muted-foreground">
-          No secrets are logged. All mock operations are local.
+          No secrets are logged. All sensitive headers/queries are redacted in UI.
         </footer>
       </div>
     </div>

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Response
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -10,6 +10,8 @@ from typing import List, Optional, Dict, Any, Tuple
 import uuid
 from datetime import datetime
 import requests
+import time
+import re
 
 
 ROOT_DIR = Path(__file__).parent
@@ -88,6 +90,7 @@ class Run(BaseModel):
     finished_at: Optional[datetime] = None
     results: List[AssertionResult] = Field(default_factory=list)
     junit_path: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = None
 
 class Artifact(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -100,12 +103,31 @@ class Artifact(BaseModel):
 # ---------------
 # Utilities
 # ---------------
+SENSITIVE_RE = re.compile(r"(?i)(token|key|secret|password)")
+
 
 def mask_secrets(text: str) -> str:
     if not text:
         return text
-    import re
     return re.sub(r"(?i)(token|key|secret|password)=([^\s&]+)", r"\1=***", text)
+
+
+def redact_dict(d: Any) -> Any:
+    # recursively redact dict keys and URL queries containing sensitive terms
+    if isinstance(d, dict):
+        out = {}
+        for k, v in d.items():
+            if SENSITIVE_RE.search(str(k)):
+                out[k] = "***"
+            else:
+                out[k] = redact_dict(v)
+        return out
+    if isinstance(d, list):
+        return [redact_dict(x) for x in d]
+    if isinstance(d, str):
+        # redact query parts like ?token=... or &api_key=...
+        return re.sub(r"(?i)(token|key|secret|password)=([^&\s]+)", r"\1=***", d)
+    return d
 
 
 def ensure_dir(p: Path) -> None:
@@ -252,15 +274,17 @@ def generate_junit_xml(run: Run) -> str:
 
 
 # ---------------
-# n8n Client
+# n8n Client with retries and redaction
 # ---------------
 class N8nClient:
     def __init__(self) -> None:
         self.base_url = (os.environ.get("N8N_BASE_URL") or "").rstrip("/")
         self.api_key = os.environ.get("N8N_API_KEY")
         self.session = requests.Session()
-        self.session.headers.update({"X-N8N-API-KEY": self.api_key or ""})
-        self.timeout = 20
+        if self.api_key:
+            self.session.headers.update({"X-N8N-API-KEY": self.api_key})
+        self.req_timeout = 10
+        self.retries = 2
 
     def _api(self, path: str) -> str:
         return f"{self.base_url}/api/v1/{path.lstrip('/')}"
@@ -268,22 +292,37 @@ class N8nClient:
     def _rest(self, path: str) -> str:
         return f"{self.base_url}/rest/{path.lstrip('/')}"
 
-    def _post_json(self, url: str, payload: Dict[str, Any]) -> requests.Response:
-        return self.session.post(url, json=payload, timeout=self.timeout)
+    def _req(self, method: str, url: str, json_payload: Optional[Dict[str, Any]] = None, auth_header: bool = True) -> requests.Response:
+        backoff = 0.5
+        last_exc = None
+        for attempt in range(self.retries + 1):
+            try:
+                headers = {}
+                if auth_header and self.api_key:
+                    headers["X-N8N-API-KEY"] = self.api_key
+                resp = self.session.request(method=method, url=url, json=json_payload, headers=headers or None, timeout=self.req_timeout)
+                if resp.status_code >= 500 and attempt < self.retries:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                return resp
+            except Exception as e:
+                last_exc = e
+                if attempt < self.retries:
+                    time.sleep(backoff)
+                    backoff *= 2
+                else:
+                    raise
+        raise last_exc  # should not reach
 
-    def _delete(self, url: str) -> requests.Response:
-        return self.session.delete(url, timeout=self.timeout)
-
-    def create_workflow(self, name: str, nodes: List[Dict[str, Any]], connections: Dict[str, Any], active: bool = False) -> Dict[str, Any]:
+    def create_workflow(self, name: str, nodes: List[Dict[str, Any]], connections: Dict[str, Any], active: bool = True) -> Dict[str, Any]:
         payload = {"name": name, "nodes": nodes, "connections": connections, "active": active}
-        # Try /api/v1 first, then fallback to /rest
-        resp = self._post_json(self._api("workflows"), payload)
+        resp = self._req("POST", self._api("workflows"), payload)
         if resp.status_code == 404:
-            resp = self._post_json(self._rest("workflows"), payload)
+            resp = self._req("POST", self._rest("workflows"), payload)
         if resp.status_code not in (200, 201):
             raise HTTPException(status_code=502, detail=f"n8n create workflow failed: {resp.status_code}")
-        data = resp.json()
-        # Normalize a few possible shapes
+        data = resp.json() if resp.content else {}
         if isinstance(data, dict) and "id" in data:
             return data
         if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
@@ -291,20 +330,75 @@ class N8nClient:
         return data
 
     def delete_workflow(self, workflow_id: str) -> None:
-        url = self._api(f"workflows/{workflow_id}")
-        resp = self._delete(url)
-        if resp.status_code == 404:
-            url = self._rest(f"workflows/{workflow_id}")
-            resp = self._delete(url)
-        # Accept 200/204; ignore other errors silently to avoid leaking details
+        try:
+            resp = self._req("DELETE", self._api(f"workflows/{workflow_id}"))
+            if resp.status_code == 404:
+                self._req("DELETE", self._rest(f"workflows/{workflow_id}"))
+        except Exception:
+            # Swallow to ensure cleanup best-effort
+            pass
 
-    def build_webhook_url(self, test_path: str, is_test: bool = True) -> str:
+    def build_webhook_url(self, path_only: str, is_test: bool = True) -> str:
         seg = "webhook-test" if is_test else "webhook"
-        return f"{self.base_url}/{seg}/{test_path.lstrip('/')}"
+        return f"{self.base_url}/{seg}/{path_only.lstrip('/')}"
+
+    def execute_webhook_test(self, path_only: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any], str]:
+        url = self.build_webhook_url(path_only, is_test=True)
+        backoff = 0.5
+        last_exc = None
+        for attempt in range(self.retries + 1):
+            try:
+                resp = self._req("POST", url, json_payload=body, auth_header=False)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+                return resp.status_code, data, url
+            except Exception as e:
+                last_exc = e
+                if attempt < self.retries:
+                    time.sleep(backoff)
+                    backoff *= 2
+                else:
+                    raise HTTPException(status_code=504, detail="webhook-test execution timeout")
+        raise HTTPException(status_code=504, detail="webhook-test execution timeout")
+
+    def fetch_recent_execution_log(self, workflow_id: str) -> List[str]:
+        urls = [self._api(f"executions?workflowId={workflow_id}&limit=1&includeData=true"), self._rest(f"executions?workflowId={workflow_id}&limit=1&includeData=true")]
+        for u in urls:
+            try:
+                resp = self._req("GET", u)
+                if resp.status_code == 200 and resp.content:
+                    j = resp.json()
+                    # Normalize potential shapes
+                    execs = None
+                    if isinstance(j, dict):
+                        execs = j.get("data") or j.get("executions") or j.get("items") or j.get("results")
+                    if isinstance(execs, list) and execs:
+                        e0 = execs[0]
+                        lines = []
+                        # Try common execution structure
+                        run_data = None
+                        if isinstance(e0, dict):
+                            run_data = (e0.get("data") or e0.get("resultData") or {}).get("resultData") or (e0.get("data") or {}).get("resultData")
+                            if run_data and isinstance(run_data, dict):
+                                rd = run_data.get("runData", {})
+                                for node_name, arr in rd.items():
+                                    if isinstance(arr, list):
+                                        for idx, item in enumerate(arr):
+                                            out = item.get("data", {}).get("main") if isinstance(item, dict) else None
+                                            lines.append(f"Node {node_name} step {idx}")
+                                if lines:
+                                    return lines[:20]
+                        # Fallback to dump keys
+                        lines = [f"keys: {list(e0.keys())}"]
+                        return lines[:20]
+            except Exception:
+                continue
+        return []
 
 
 def build_uppercase_workflow(path_only: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    # Node names must match connections keys
     nodes = [
         {
             "id": "Webhook",
@@ -437,33 +531,40 @@ async def test_run(payload: TestRunInput):
     if not fp or not ap:
         raise HTTPException(status_code=404, detail="FixturePack or AssertionPack not found")
 
-    run = Run(workflow_contract_id=payload.workflow_contract_id, status="QUEUED")
+    run = Run(workflow_contract_id=payload.workflow_contract_id, status="QUEUED", meta={})
     await db.runs.insert_one(run.model_dump())
 
-    # Simulate state machine
     run.status = "PROVISIONING"
 
     use_n8n = bool(payload.use_n8n) and bool(os.environ.get("N8N_BASE_URL")) and bool(os.environ.get("N8N_API_KEY"))
+    temp_workflow_id = None
+    webhook_test_url = None
+    webhook_prod_url = None
+    workflow_json_path = None
 
     try:
         if use_n8n:
-            # Build and create a temporary n8n workflow
             client = N8nClient()
             unique_path = f"avc-{run.id[:8]}"
             nodes, connections = build_uppercase_workflow(unique_path)
             wf = client.create_workflow(name=f"AVC Test {run.id[:8]}", nodes=nodes, connections=connections, active=True)
-            wf_id = str(wf.get("id") or wf.get("_id") or wf.get("data", {}).get("id"))
+            temp_workflow_id = str(wf.get("id") or wf.get("_id") or wf.get("data", {}).get("id"))
+            # Persist created workflow JSON as artifact
+            artifacts_dir = ROOT_DIR / "artifacts"
+            ensure_dir(artifacts_dir / "tmp")
+            workflow_json_path = artifacts_dir / f"{run.id}-workflow.json"
+            with open(workflow_json_path, "w", encoding="utf-8") as f:
+                import json
+                json.dump(wf, f, indent=2)
+            await db.artifacts.insert_one(Artifact(run_id=run.id, kind="workflow_json", path=str(workflow_json_path)).model_dump())
+
             run.status = "EXECUTING"
-            # Execute test webhook
-            webhook_url = client.build_webhook_url(unique_path, is_test=True)
+            webhook_test_url = client.build_webhook_url(unique_path, is_test=True)
+            webhook_prod_url = client.build_webhook_url(unique_path, is_test=False)
             fixture = fp["fixtures"][0]
-            body = fixture.get("body", {})
-            resp = requests.post(webhook_url, json=body, timeout=20)
-            # Build trace from real response
-            try:
-                resp_json = resp.json()
-            except Exception:
-                resp_json = {}
+            body = redact_dict(fixture.get("body", {}))  # ensure no secrets in request body we log
+            status_code, resp_json, _ = client.execute_webhook_test(unique_path, body)
+            exec_lines = client.fetch_recent_execution_log(temp_workflow_id)
             trace = {
                 "nodes": [
                     {"id": "webhook", "type": "Webhook", "status": "completed"},
@@ -471,11 +572,17 @@ async def test_run(payload: TestRunInput):
                     {"id": "respond", "type": "Respond", "status": "completed"},
                 ],
                 "httpOutgoing": [],
-                "response": {"status": resp.status_code, "body": resp_json},
+                "response": {"status": status_code, "body": resp_json},
             }
+            run.meta.update({
+                "workflowId": temp_workflow_id,
+                "webhookTestUrl": redact_dict(webhook_test_url),
+                "webhookProdUrl": redact_dict(webhook_prod_url),
+                "executionLogFirst20": exec_lines[:20] if exec_lines else [],
+            })
         else:
             run.status = "EXECUTING"
-            # Mock execution: take the only fixture and simulate uppercase response
+            # Mock execution
             fixture = fp["fixtures"][0]
             body = fixture.get("body", {})
             msg = str(body.get("msg", ""))
@@ -493,19 +600,26 @@ async def test_run(payload: TestRunInput):
         logging.exception("Execution error: %s", mask_secrets(str(e)))
         run.status = "FAIL"
         run.finished_at = datetime.utcnow()
+        # Clean up temp workflow if created
+        try:
+            if temp_workflow_id:
+                N8nClient().delete_workflow(temp_workflow_id)
+        except Exception:
+            pass
         await db.runs.update_one({"id": run.id}, {"$set": run.model_dump()})
         return TestRunResponse(run=run)
     finally:
-        # Cleanup temp workflow if created
+        # Always attempt cleanup
         try:
-            if use_n8n:
-                client.delete_workflow(wf_id)
+            if temp_workflow_id:
+                N8nClient().delete_workflow(temp_workflow_id)
         except Exception:
             pass
 
     run.status = "ASSERTING"
     results: List[AssertionResult] = []
-    for a in ap["assertions"]:
+    ap_doc = ap
+    for a in ap_doc["assertions"]:
         ok, message = eval_assertion(a.get("operator"), a.get("args", {}), trace)
         results.append(AssertionResult(assertion_id=a.get("id"), operator=a.get("operator"), passed=ok, message=message))
 
@@ -525,8 +639,7 @@ async def test_run(payload: TestRunInput):
 
     await db.runs.update_one({"id": run.id}, {"$set": run.model_dump()})
 
-    artifact = Artifact(run_id=run.id, kind="junit", path=str(junit_path), url=None)
-    await db.artifacts.insert_one(artifact.model_dump())
+    await db.artifacts.insert_one(Artifact(run_id=run.id, kind="junit", path=str(junit_path)).model_dump())
 
     return TestRunResponse(run=run)
 
@@ -537,6 +650,22 @@ async def get_run(run_id: str):
     if not r:
         raise HTTPException(status_code=404, detail="Run not found")
     return TestRunResponse(run=Run(**r))
+
+
+@api_router.get("/artifacts/{artifact_id}")
+async def download_artifact(artifact_id: str):
+    a = await db.artifacts.find_one({"id": artifact_id})
+    if not a:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    path = a.get("path")
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File missing")
+    # naive content type; callers can rely on filename extension
+    with open(path, 'rb') as f:
+        data = f.read()
+    filename = os.path.basename(path)
+    headers = {"Content-Disposition": f"attachment; filename={filename}"}
+    return Response(content=data, media_type="application/octet-stream", headers=headers)
 
 
 # Include the router in the main app
