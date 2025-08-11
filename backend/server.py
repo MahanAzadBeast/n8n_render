@@ -233,7 +233,7 @@ def eval_assertion(operator: str, args: Dict[str, Any], trace: Dict[str, Any]) -
                     ok = a > b
                     return ok, f"{a} &gt; {b}" if ok else f"{a} !&gt; {b}"
                 else:
-                    ok = a &lt; b
+                    ok = a < b
                     return ok, f"{a} &lt; {b}" if ok else f"{a} !&lt; {b}"
         return False, f"Unknown operator: {op}"
     except Exception as e:
